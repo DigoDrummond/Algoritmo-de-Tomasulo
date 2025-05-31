@@ -1,0 +1,6 @@
+ADD R1, R2, R3   
+MUL R1, R4, R5    
+ADD R6, R1, R7    
+MUL R8, R1, R9    
+ADD R1, R10, R11  
+MUL R12, R1, R13  
