@@ -35,10 +35,12 @@ struct Instruction {
     int exec_start_cycle;
     int exec_end_cycle;
     int write_cycle;
+    int commit_cycle;  // Adicionado campo commit_cycle
     
     Instruction(int _id, OpType _op, string _dest, string _src1, string _src2 = "", int _addr = 0)
         : id(_id), op(_op), dest(_dest), src1(_src1), src2(_src2), address(_addr), 
-          state(ISSUED), issue_cycle(-1), exec_start_cycle(-1), exec_end_cycle(-1), write_cycle(-1) {}
+          state(ISSUED), issue_cycle(-1), exec_start_cycle(-1), exec_end_cycle(-1), 
+          write_cycle(-1), commit_cycle(-1) {}
 };
 
 // Estação de reserva
@@ -77,6 +79,21 @@ struct ExecutingInstruction {
         : station_idx(idx), station_type(type), remaining_cycles(cycles), instruction_id(id) {}
 };
 
+// Estrutura do ROB
+struct ReorderBufferEntry {
+    bool busy;
+    int instruction_index;
+    OpType type;
+    string state;  // EMPTY, ISSUE, EXECUTE, WRITE_RESULT
+    string destination_register;
+    float value;
+    int address;
+    bool value_ready;
+    
+    ReorderBufferEntry() : busy(false), instruction_index(-1), type(ADD), 
+                          state("EMPTY"), value(0), address(0), value_ready(false) {}
+};
+
 class TomasuloSimulator {
 private:
     // Estações de reserva
@@ -98,14 +115,21 @@ private:
     // Latências das operacoes
     map<OpType, int> latencies;
     
-    // Buffer de resultados (Common Data Bus)
-    vector<pair<string, float>> cdb_buffer;
-    
     // Memória simulada
     vector<float> memory;
     
     // Instrucoes em execucao
     vector<ExecutingInstruction> executing_instructions;
+    
+    // Reorder Buffer (ROB)
+    vector<ReorderBufferEntry> rob;
+    int rob_size;
+    int rob_head;
+    int rob_tail;
+    int rob_entries_available;
+    
+    // Fila de instruções completadas aguardando CDB
+    vector<tuple<int, float, string>> completed_for_cdb;
 
 public:
     TomasuloSimulator() : current_cycle(1) {
@@ -118,21 +142,24 @@ public:
         // Definir latências
         latencies[ADD] = 2;
         latencies[SUB] = 2;
-        latencies[MUL] = 4;
-        latencies[DIV] = 8;
+        latencies[MUL] = 10;
+        latencies[DIV] = 40;
         latencies[LOAD] = 3;
         latencies[STORE] = 3;
         
+        // Inicializar ROB
+        rob_size = 16;
+        rob.resize(rob_size);
+        rob_head = 0;
+        rob_tail = 0;
+        rob_entries_available = rob_size;
+        
         // Inicializar registradores com valores aleatórios
-        srand(time(0)); // Inicializa o gerador de números aleatórios
+        srand(time(0));
         for (int i = 0; i < 32; i++) {
-            // Gera um número aleatório entre 0 e 9, multiplica por 10
             float random_value = (rand() % 10) * 10.0;
-            
-            // Inicializa registradores F e R com o mesmo valor
             registers["R" + to_string(i)] = Register();
             registers["F" + to_string(i)] = Register();
-            
             registers["R" + to_string(i)].value = random_value;
             registers["F" + to_string(i)].value = random_value;
         }
@@ -416,76 +443,23 @@ public:
         }
     }
     
-    // Escrever resultados (Common Data Bus)
-    void writeResults() {
-        for (auto& result : cdb_buffer) {
-            string producer = result.first;
-            float value = result.second;
-            
-            // Atualizar registradores que dependem deste resultado
-            for (auto& reg : registers) {
-                if (reg.second.producer_tag == producer) {
-                    reg.second.value = value;
-                    reg.second.ready = true;
-                    reg.second.busy = false;
-                    reg.second.producer_tag = "";
-                }
-            }
-            
-            // Atualizar estações de reserva que aguardam este resultado
-            vector<vector<ReservationStation>*> all_stations = {
-                &add_stations, &mult_stations, &load_stations, &store_stations
-            };
-            
-            for (auto stations : all_stations) {
-                for (auto& station : *stations) {
-                    if (station.qj == producer) {
-                        station.vj = to_string(value);
-                        station.qj = "";
-                    }
-                    if (station.qk == producer) {
-                        station.vk = to_string(value);
-                        station.qk = "";
-                    }
-                }
-            }
-            
-            // Liberar estação que produziu o resultado
-            for (auto stations : all_stations) {
-                for (auto& station : *stations) {
-                    if (station.busy && station.cycles_left == 0) {
-                        station.busy = false;
-                        station.instr_id = -1;
-                    }
-                }
-            }
-        }
-        
-        cdb_buffer.clear();
-    }
-    
     // Imprimir estado atual
     void printState() {
-        cout << "\n==================== CICLO " << current_cycle << " ====================\n";
+        cout << "\n==================== CICLO " << current_cycle << " ====================" << endl;
         
         // Imprimir estações de reserva ADD/SUB
-        cout << "\nEstacoes de Reserva ADD/SUB:\n";
-        cout << setw(8) << "Estacao" << setw(8) << "Busy" << setw(8) << "Op" 
-             << setw(12) << "Vj" << setw(12) << "Vk" << setw(12) << "Qj" 
-             << setw(12) << "Qk" << setw(10) << "Dest" << setw(8) << "Cycles\n";
-        cout << string(88, '-') << "\n";
+        cout << "\nEstações de Reserva ADD/SUB:" << endl;
+        cout << setw(8) << "Estação" << setw(8) << "Busy" << setw(8) << "Op" << setw(12) << "Vj" 
+             << setw(12) << "Vk" << setw(12) << "Qj" << setw(12) << "Qk" << setw(10) << "Dest" 
+             << setw(8) << "Ciclos" << endl;
+        cout << string(88, '-') << endl;
         
-        for (int i = 0; i < add_stations.size(); i++) {
-            auto& station = add_stations[i];
-            cout << setw(8) << ("Add" + to_string(i + 1))
-                 << setw(8) << (station.busy ? "Sim" : "Nao")
-                 << setw(8) << (station.busy ? (station.op == ADD ? "ADD" : "SUB") : "-")
-                 << setw(12) << (station.vj.empty() ? "-" : station.vj)
-                 << setw(12) << (station.vk.empty() ? "-" : station.vk)
-                 << setw(12) << (station.qj.empty() ? "-" : station.qj)
-                 << setw(12) << (station.qk.empty() ? "-" : station.qk)
-                 << setw(10) << (station.busy ? to_string(station.dest_reg) : "-")
-                 << setw(8) << (station.busy ? to_string(station.cycles_left) : "-") << "\n";
+        for (size_t i = 0; i < add_stations.size(); i++) {
+            const auto& station = add_stations[i];
+            cout << setw(7) << "Add" + to_string(i+1) << setw(8) << station.busy << setw(8) 
+                 << station.op << setw(12) << station.vj << setw(12) << station.vk 
+                 << setw(12) << station.qj << setw(12) << station.qk 
+                 << setw(10) << station.dest << setw(8) << station.cycles_left << endl;
         }
         
         // Imprimir estações de reserva MUL/DIV
@@ -576,62 +550,186 @@ public:
             }
         }
         
-        cout << "\nInstrucoes na fila: " << instruction_queue.size() << "\n";
+        // Imprimir estado do ROB
+        cout << "\nReorder Buffer (ROB):" << endl;
+        cout << setw(6) << "ROB#" << setw(6) << "Busy" << setw(8) << "InstIdx" << setw(8) << "Type" 
+             << setw(12) << "State" << setw(8) << "DestReg" << setw(8) << "ValRdy" 
+             << setw(8) << "Value" << setw(8) << "Addr" << endl;
+        cout << string(70, '-') << endl;
+        
+        for (size_t i = 0; i < rob.size(); i++) {
+            const auto& entry = rob[i];
+            if (entry.busy) {
+                cout << setw(6) << i << setw(6) << entry.busy << setw(8) << entry.instruction_index 
+                     << setw(8) << entry.type << setw(12) << entry.state 
+                     << setw(8) << entry.destination_register << setw(8) << entry.value_ready 
+                     << setw(8) << entry.value << setw(8) << entry.address << endl;
+            }
+        }
+        
+        // Imprimir estado da fila CDB
+        cout << "\nCommon Data Bus (CDB):" << endl;
+        cout << setw(8) << "Posição" << setw(8) << "InstID" << setw(12) << "Valor" << setw(8) << "ROB" << endl;
+        cout << string(36, '-') << endl;
+        
+        for (size_t i = 0; i < completed_for_cdb.size(); i++) {
+            const auto& cdb_entry = completed_for_cdb[i];
+            cout << setw(8) << i << setw(8) << get<0>(cdb_entry) << setw(12) << fixed << setprecision(2) 
+                 << get<1>(cdb_entry) << setw(8) << get<2>(cdb_entry) << endl;
+        }
+        
+        cout << "\nInstruções na fila: " << instruction_queue.size() << endl;
+        cout << "Instruções completadas aguardando CDB: " << completed_for_cdb.size() << endl;
+        cout << "ROB Head: " << rob_head << ", Tail: " << rob_tail 
+             << ", Available: " << rob_entries_available << endl;
     }
     
     // Simular execução
     void simulate() {
-        cout << "========== SIMULACAO DO ALGORITMO DE TOMASULO ==========\n";
+        cout << "========== SIMULACAO DO ALGORITMO DE TOMASULO ==========" << endl;
         
-        while (!instruction_queue.empty() || !executing_instructions.empty()) {
-            cout << "\nProcessando ciclo " << current_cycle << "...\n";
+        while (hasActiveInstructions()) {
+            cout << "\nProcessando ciclo " << current_cycle << "..." << endl;
             
-            // 1. Emitir nova instrucao (se possivel)
+            // 1. Commit
+            commitInstruction();
+            
+            // 2. Write-Back (CDB)
+            processWriteBack();
+            
+            // 3. Issue
             if (issueInstruction()) {
-                cout << "Instrucao emitida no ciclo " << current_cycle << "\n";
+                cout << "Instrução emitida no ciclo " << current_cycle << endl;
             }
             
-            // 2. Executar instrucoes em progresso
+            // 4. Execute
             executeInstructions();
             
-            // 3. Escrever resultados
-            writeResults();
-            
-            // 4. Mostrar estado atual
+            // 5. Mostrar estado atual
             printState();
             
             current_cycle++;
             
             // Limite de segurança
             if (current_cycle > 50) {
-                cout << "\nSimulacao interrompida (limite de ciclos atingido)\n";
+                cout << "\nSimulação interrompida (limite de ciclos atingido)" << endl;
                 break;
             }
         }
         
-        cout << "\n========== SIMULACAO CONCLUIDA ==========\n";
+        cout << "\n========== SIMULACAO CONCLUIDA ==========" << endl;
+    }
+    
+    void processWriteBack() {
+        if (completed_for_cdb.empty()) return;
+        
+        const auto& cdb_entry = completed_for_cdb.front();
+        int instr_id = get<0>(cdb_entry);
+        float result = get<1>(cdb_entry);
+        string rob_idx_str = get<2>(cdb_entry);
+        
+        completed_for_cdb.erase(completed_for_cdb.begin());
+        
+        int rob_idx = stoi(rob_idx_str);
+        if (rob_idx >= 0 && rob_idx < rob_size) {
+            ReorderBufferEntry& rob_entry = rob[rob_idx];
+            if (rob_entry.busy) {
+                rob_entry.value = result;
+                rob_entry.value_ready = true;
+                rob_entry.state = "WRITE_RESULT";
+                
+                // Atualizar registradores e estações dependentes
+                updateDependentRS(rob_idx, result);
+                
+                // Liberar a estação de reserva
+                for (auto& station : getAllStations()) {
+                    if (station->dest == rob_idx_str) {
+                        station->busy = false;
+                        station->instr_id = -1;
+                        station->qj = "";
+                        station->qk = "";
+                        station->vj = "0";
+                        station->vk = "0";
+                        station->address = 0;
+                        station->dest = "";
+                    }
+                }
+            }
+        }
+    }
+    
+    void updateDependentRS(int producing_rob_idx, float result_value) {
+        string producing_tag = to_string(producing_rob_idx);
+        
+        for (auto& station : getAllStations()) {
+            if (station->busy) {
+                if (station->qj == producing_tag) {
+                    station->vj = to_string(result_value);
+                    station->qj = "";
+                }
+                if (station->qk == producing_tag) {
+                    station->vk = to_string(result_value);
+                    station->qk = "";
+                }
+            }
+        }
+    }
+    
+    void commitInstruction() {
+        if (rob_entries_available == rob_size || !rob[rob_head].busy) return;
+        
+        ReorderBufferEntry& head_entry = rob[rob_head];
+        
+        if (head_entry.state == "WRITE_RESULT") {
+            if (head_entry.type == STORE && !head_entry.value_ready) return;
+            
+            Instruction& instr = all_instructions[head_entry.instruction_index];
+            instr.commit_cycle = current_cycle;
+            
+            if (head_entry.type != STORE) {
+                registers[head_entry.destination_register].value = head_entry.value;
+                registers[head_entry.destination_register].ready = true;
+                registers[head_entry.destination_register].busy = false;
+                registers[head_entry.destination_register].producer_tag = "";
+            } else {
+                if (head_entry.address >= 0 && head_entry.address < memory.size()) {
+                    memory[head_entry.address] = head_entry.value;
+                }
+            }
+            
+            cout << "Ciclo " << current_cycle << ": Commit Inst " 
+                 << head_entry.instruction_index << " (ROB " << rob_head << ")" << endl;
+            
+            head_entry.busy = false;
+            head_entry.state = "EMPTY";
+            rob_head = (rob_head + 1) % rob_size;
+            rob_entries_available++;
+        }
+    }
+    
+    vector<ReservationStation*> getAllStations() {
+        vector<ReservationStation*> all;
+        for (auto& station : add_stations) all.push_back(&station);
+        for (auto& station : mult_stations) all.push_back(&station);
+        for (auto& station : load_stations) all.push_back(&station);
+        for (auto& station : store_stations) all.push_back(&station);
+        return all;
     }
     
 private:
     bool hasActiveInstructions() {
-        vector<vector<ReservationStation>*> all_stations = {
-            &add_stations, &mult_stations, &load_stations, &store_stations
-        };
-        
-        for (auto stations : all_stations) {
-            for (auto& station : *stations) {
-                if (station.busy) return true;
-            }
-        }
-        return false;
+        return !instruction_queue.empty() || 
+               !executing_instructions.empty() || 
+               !completed_for_cdb.empty() || 
+               rob_entries_available != rob_size;
     }
 };
 
 int main() {
     TomasuloSimulator simulator;
     
-    cout << "========== SIMULADOR DO ALGORITMO DE TOMASULO ==========\n";
-    cout << "Digite o caminho completo do arquivo de instrucoes: ";
+    cout << "========== SIMULADOR DO ALGORITMO DE TOMASULO ==========" << endl;
+    cout << "Digite o nome do arquivo de instrucoes: ";
     
     string filename;
     getline(cin, filename);
