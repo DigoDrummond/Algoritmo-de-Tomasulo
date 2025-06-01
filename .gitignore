@@ -1,0 +1,50 @@
+output
+
+# Arquivos de compilação
+*.o
+*.obj
+*.lo
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+*.exe
+*.out
+*.app
+
+# Arquivos de build
+/build/
+/bin/
+/Debug/
+/debug/
+/Release/
+/release/
+/dist/
+/CMakeFiles/
+/CMakeCache.txt
+/Makefile
+cmake_install.cmake
+
+# Arquivos gerados por IDEs
+*.sdf
+*.suo
+*.opensdf
+*.user
+*.vcxproj*
+*.code-workspace
+*.DS_Store
+*.idea/
+*.vscode/
+
+# Arquivos temporários
+*~
+*.swp
+*.bak
+*.tmp
+
+# Arquivos de log
+*.log
+
+# Arquivos de testes
+/test-results/
