@@ -1,6 +1,7 @@
 # Simulador do Algoritimo de Tomasulo
+Este projeto é desenvolvido no âmbito da disciplina **Arquitetura de Computadores III** do curso de **Ciências da Computação** da [**PUC Minas**](https://www.pucminas.br/destaques/Paginas/default.aspx).
 
-## Contexto
+## 🤓 Contexto
 Processadores modernos utilizam técnicas de pipeline para executar múltiplas instruções simultaneamente, explorando o **Paralelismo em Nível de Instrução (ILP)** para aumentar o desempenho. Em arquiteturas superescalares, múltiplas instruções podem ser despachadas e executadas em cada ciclo de clock.
 
 No entanto, essa execução paralela pode levar a conflitos de dados, categorizados como:
@@ -28,5 +29,5 @@ O **Algoritmo de Tomasulo** é um exemplo de **escalonamento dinâmico**. Ele ut
 
 ## 🧐 Referências
 
-1. **Rodolfo Azevedo** - *Algoritmo de Tomasulo: Trabalho MO401*. Disponível em [Unicamp](https://www.ic.unicamp.br/~rodolfoCursos/mo401/2s2005/Trabalho/049239-tomasulo.pdf).
+1. **Rodolfo Azevedo** - *Algoritmo de Tomasulo: Trabalho MO401*. Disponível em [Unicamp](https://www.ic.unicamp.br/~rodolfo/Cursos/mo401/2s2005/Trabalho/049239-tomasulo.pdf).
 2. **Tomasulo Algorithm** - Documentação e explicação detalhada disponível em [Wikipedia](https://en.wikipedia.org/wiki/Tomasulo_algorithm).
