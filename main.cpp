@@ -256,7 +256,7 @@ public:
     
     // Emitir instrucao
     bool issueInstruction() {
-        if (instruction_queue.empty()) return false;
+        if (instruction_queue.empty() || rob_entries_available == 0) return false;
         
         Instruction& instr = instruction_queue.front();
         
@@ -265,6 +265,35 @@ public:
         
         int station_idx = findFreeStation(instr.op);
         if (station_idx == -1) return false; // Hazard estrutural
+        
+        // Alocar entrada no ROB
+        int current_rob_idx = rob_tail;
+        ReorderBufferEntry& rob_entry = rob[current_rob_idx];
+        rob_entry.busy = true;
+        rob_entry.instruction_index = instr.id;
+        rob_entry.type = instr.op;
+        rob_entry.state = "ISSUE";
+        
+        // Configurar destino e endereço no ROB
+        if (instr.op != STORE) {
+            rob_entry.destination_register = instr.dest;
+        }
+        
+        if (instr.op == LOAD || instr.op == STORE) {
+            // Extrair offset e registrador base do formato offset(Rbase)
+            size_t open_paren = instr.src1.find('(');
+            size_t close_paren = instr.src1.find(')');
+            
+            if (open_paren != string::npos && close_paren != string::npos) {
+                int offset = stoi(instr.src1.substr(0, open_paren));
+                string base_reg = instr.src1.substr(open_paren + 1, close_paren - open_paren - 1);
+                rob_entry.address = offset + static_cast<int>(registers[base_reg].value);
+            }
+        }
+        
+        // Atualizar ponteiros do ROB
+        rob_tail = (rob_tail + 1) % rob_size;
+        rob_entries_available--;
         
         // Selecionar estação de reserva apropriada
         ReservationStation* station;
@@ -296,36 +325,28 @@ public:
         station->op = instr.op;
         station->instr_id = instr.id;
         station->cycles_left = latencies[instr.op];
-        station->dest = instr.dest;  // Adicionar o registrador destino
+        station->dest = to_string(current_rob_idx);  // Tag do ROB como destino
         
-        // Configurar endereco para LOAD/STORE
+        // Configurar endereço para LOAD/STORE
         if (instr.op == LOAD || instr.op == STORE) {
-            // Extrair offset e registrador base do formato offset(Rbase)
-            size_t open_paren = instr.src1.find('(');
-            size_t close_paren = instr.src1.find(')');
-            
-            if (open_paren != string::npos && close_paren != string::npos) {
-                int offset = stoi(instr.src1.substr(0, open_paren));
-                string base_reg = instr.src1.substr(open_paren + 1, close_paren - open_paren - 1);
-                station->address = offset + static_cast<int>(registers[base_reg].value);
-            }
+            station->address = rob_entry.address;
         }
         
         // Verificar dependências e renomear registradores
         if (instr.op != STORE) {
-            // Para instrucoes que escrevem em registrador
-            registers[instr.dest].producer_tag = station_name;
+            // Para instruções que escrevem em registrador
+            registers[instr.dest].producer_tag = to_string(current_rob_idx);  // Tag do ROB
             registers[instr.dest].ready = false;
             registers[instr.dest].busy = true;
         }
         
-        // Configurar operandos
+        // Configurar operandos usando tags do ROB
         if (registers[instr.src1].ready) {
             station->vj = to_string(registers[instr.src1].value);
             station->qj = "";
         } else {
             station->vj = "";
-            station->qj = registers[instr.src1].producer_tag;
+            station->qj = registers[instr.src1].producer_tag;  // Tag do ROB
         }
         
         if (!instr.src2.empty() && instr.op != LOAD && instr.op != STORE) {
@@ -334,11 +355,11 @@ public:
                 station->qk = "";
             } else {
                 station->vk = "";
-                station->qk = registers[instr.src2].producer_tag;
+                station->qk = registers[instr.src2].producer_tag;  // Tag do ROB
             }
         }
         
-        // Adicionar à lista de instrucoes em execucao
+        // Adicionar à lista de instruções em execução
         executing_instructions.push_back(ExecutingInstruction(
             station_idx,
             station_name,
@@ -406,30 +427,8 @@ public:
                             break;
                     }
                     
-                    // Atualizar registradores e estações dependentes imediatamente
-                    if (station->op != STORE) {
-                        registers[station->dest].value = result;
-                        registers[station->dest].ready = true;
-                        registers[station->dest].busy = false;
-                        registers[station->dest].producer_tag = "";
-                    }
-                    
-                    // Atualizar estações que dependem deste resultado
-                    string station_name = it->station_type + to_string(it->station_idx + 1);
-                    for (auto stations : all_stations) {
-                        for (auto& rs : *stations) {
-                            if (rs.busy) {
-                                if (rs.qj == station_name) {
-                                    rs.vj = to_string(result);
-                                    rs.qj = "";
-                                }
-                                if (rs.qk == station_name) {
-                                    rs.vk = to_string(result);
-                                    rs.qk = "";
-                                }
-                            }
-                        }
-                    }
+                    // Adicionar ao CDB
+                    completed_for_cdb.push_back({station->instr_id, result, station->dest});
                     
                     // Liberar a estação
                     station->busy = false;
@@ -569,7 +568,7 @@ public:
         
         // Imprimir estado da fila CDB
         cout << "\nCommon Data Bus (CDB):" << endl;
-        cout << setw(8) << "Posição" << setw(8) << "InstID" << setw(12) << "Valor" << setw(8) << "ROB" << endl;
+        cout << setw(8) << "Posicao" << setw(8) << "InstID" << setw(12) << "Valor" << setw(8) << "ROB" << endl;
         cout << string(36, '-') << endl;
         
         for (size_t i = 0; i < completed_for_cdb.size(); i++) {
@@ -578,8 +577,8 @@ public:
                  << get<1>(cdb_entry) << setw(8) << get<2>(cdb_entry) << endl;
         }
         
-        cout << "\nInstruções na fila: " << instruction_queue.size() << endl;
-        cout << "Instruções completadas aguardando CDB: " << completed_for_cdb.size() << endl;
+        cout << "\nInstrucoes na fila: " << instruction_queue.size() << endl;
+        cout << "Instrucoes completadas aguardando CDB: " << completed_for_cdb.size() << endl;
         cout << "ROB Head: " << rob_head << ", Tail: " << rob_tail 
              << ", Available: " << rob_entries_available << endl;
     }
@@ -638,8 +637,29 @@ public:
                 rob_entry.value_ready = true;
                 rob_entry.state = "WRITE_RESULT";
                 
-                // Atualizar registradores e estações dependentes
-                updateDependentRS(rob_idx, result);
+                // Atualizar registradores que dependem deste resultado
+                for (auto& reg : registers) {
+                    if (reg.second.producer_tag == rob_idx_str) {
+                        reg.second.value = result;
+                        reg.second.ready = true;
+                        reg.second.busy = false;
+                        reg.second.producer_tag = "";
+                    }
+                }
+                
+                // Atualizar estações de reserva que dependem deste resultado
+                for (auto& station : getAllStations()) {
+                    if (station->busy) {
+                        if (station->qj == rob_idx_str) {
+                            station->vj = to_string(result);
+                            station->qj = "";
+                        }
+                        if (station->qk == rob_idx_str) {
+                            station->vk = to_string(result);
+                            station->qk = "";
+                        }
+                    }
+                }
                 
                 // Liberar a estação de reserva
                 for (auto& station : getAllStations()) {
@@ -658,31 +678,12 @@ public:
         }
     }
     
-    void updateDependentRS(int producing_rob_idx, float result_value) {
-        string producing_tag = to_string(producing_rob_idx);
-        
-        for (auto& station : getAllStations()) {
-            if (station->busy) {
-                if (station->qj == producing_tag) {
-                    station->vj = to_string(result_value);
-                    station->qj = "";
-                }
-                if (station->qk == producing_tag) {
-                    station->vk = to_string(result_value);
-                    station->qk = "";
-                }
-            }
-        }
-    }
-    
     void commitInstruction() {
         if (rob_entries_available == rob_size || !rob[rob_head].busy) return;
         
         ReorderBufferEntry& head_entry = rob[rob_head];
         
-        if (head_entry.state == "WRITE_RESULT") {
-            if (head_entry.type == STORE && !head_entry.value_ready) return;
-            
+        if (head_entry.state == "WRITE_RESULT" && head_entry.value_ready) {
             Instruction& instr = all_instructions[head_entry.instruction_index];
             instr.commit_cycle = current_cycle;
             
