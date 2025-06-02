@@ -198,6 +198,258 @@ O simulador exibe o estado detalhado a cada ciclo, incluindo:
 - Instruções em execução
 - Conteúdo da memória
 
+## Implementação Detalhada
+
+### 1. Estruturas de Dados
+
+#### Instruction
+```cpp
+struct Instruction {
+    int id;                 // Identificador único da instrução
+    OpType op;             // Tipo de operação (ADD, SUB, MUL, etc.)
+    string dest;           // Registrador destino
+    string src1, src2;     // Registradores fonte
+    int address;           // Endereço para LOAD/STORE
+    InstrState state;      // Estado atual da instrução
+    int issue_cycle;       // Ciclo de emissão
+    int exec_start_cycle;  // Ciclo de início de execução
+    int exec_end_cycle;    // Ciclo de fim de execução
+    int write_cycle;       // Ciclo de write-back
+    int commit_cycle;      // Ciclo de commit
+};
+```
+
+#### ReservationStation
+```cpp
+struct ReservationStation {
+    bool busy;             // Indica se a estação está ocupada
+    OpType op;             // Operação a ser executada
+    int instr_id;          // ID da instrução em execução
+    string vj, vk;         // Valores dos operandos
+    string qj, qk;         // Tags das estações produtoras
+    string dest;           // Tag do ROB destino
+    int dest_reg;          // Número do registrador destino
+    int cycles_left;       // Ciclos restantes para execução
+    int address;           // Endereço para LOAD/STORE
+};
+```
+
+#### Register
+```cpp
+struct Register {
+    float value;           // Valor atual do registrador
+    string producer_tag;   // Tag da estação que produzirá o valor
+    bool ready;           // Indica se o valor está pronto
+    bool busy;            // Indica se o registrador está ocupado
+};
+```
+
+#### ReorderBufferEntry
+```cpp
+struct ReorderBufferEntry {
+    bool busy;             // Indica se a entrada está ocupada
+    int instruction_index; // Índice da instrução
+    OpType type;          // Tipo de operação
+    string state;         // Estado atual (EMPTY, ISSUE, EXECUTE, WRITE_RESULT)
+    string destination_register; // Registrador destino
+    float value;          // Valor calculado
+    int address;          // Endereço para LOAD/STORE
+    bool value_ready;     // Indica se o valor está pronto
+};
+```
+
+### 2. Componentes do Sistema
+
+#### Estações de Reserva
+- **ADD/SUB (3 estações)**
+  - Executam operações aritméticas básicas
+  - Latência de 2 ciclos
+  - Suportam renomeação de registradores
+
+- **MUL/DIV (2 estações)**
+  - Executam operações de multiplicação e divisão
+  - Latências diferentes (MUL: 10 ciclos, DIV: 40 ciclos)
+  - Implementam divisão por zero
+
+- **LOAD/STORE (2 estações cada)**
+  - Gerenciam acesso à memória
+  - Latência de 3 ciclos
+  - Suportam endereçamento base + offset
+
+#### Banco de Registradores
+- **Registradores Inteiros (R0-R31)**
+  - Valores iniciais aleatórios
+  - Suporte a renomeação dinâmica
+  - Rastreamento de dependências
+
+- **Registradores de Ponto Flutuante (F0-F31)**
+  - Mesmas características dos inteiros
+  - Usados para operações aritméticas
+  - Suporte a precisão dupla
+
+#### Memória
+- **1024 posições**
+  - Acesso aleatório
+  - Suporte a LOAD/STORE
+  - Endereçamento base + offset
+
+#### Common Data Bus (CDB)
+- **Broadcast de resultados**
+  - Estrutura: `vector<tuple<int, float, string>>`
+  - Contém: ID da instrução, valor, tag do ROB
+  - Atualização imediata de dependências
+
+### 3. Funções Principais
+
+#### issueInstruction()
+```cpp
+bool issueInstruction() {
+    // 1. Verificar disponibilidade
+    if (instruction_queue.empty() || rob_entries_available == 0) 
+        return false;
+    
+    // 2. Verificar hazards
+    if (checkHazards(instr)) 
+        return false;
+    
+    // 3. Alocar entrada no ROB
+    int current_rob_idx = rob_tail;
+    ReorderBufferEntry& rob_entry = rob[current_rob_idx];
+    
+    // 4. Configurar estação de reserva
+    ReservationStation* station = getStation(instr.op);
+    
+    // 5. Renomear registradores
+    if (instr.op != STORE) {
+        registers[instr.dest].producer_tag = to_string(current_rob_idx);
+    }
+    
+    // 6. Configurar operandos
+    setupOperands(station, instr);
+    
+    return true;
+}
+```
+
+#### executeInstructions()
+```cpp
+void executeInstructions() {
+    for (auto& instr : executing_instructions) {
+        // 1. Decrementar ciclos
+        instr.remaining_cycles--;
+        
+        // 2. Verificar conclusão
+        if (instr.remaining_cycles <= 0) {
+            // 3. Calcular resultado
+            float result = calculateResult(instr);
+            
+            // 4. Adicionar ao CDB
+            completed_for_cdb.push_back({
+                instr.instruction_id,
+                result,
+                instr.station->dest
+            });
+        }
+    }
+}
+```
+
+#### processWriteBack()
+```cpp
+void processWriteBack() {
+    if (completed_for_cdb.empty()) return;
+    
+    // 1. Obter resultado do CDB
+    auto [instr_id, result, rob_tag] = completed_for_cdb.front();
+    
+    // 2. Atualizar ROB
+    ReorderBufferEntry& rob_entry = rob[stoi(rob_tag)];
+    rob_entry.value = result;
+    rob_entry.value_ready = true;
+    
+    // 3. Atualizar dependências
+    updateDependencies(rob_tag, result);
+    
+    // 4. Liberar estação
+    releaseStation(rob_tag);
+}
+```
+
+#### commitInstruction()
+```cpp
+void commitInstruction() {
+    if (!rob[rob_head].busy) return;
+    
+    ReorderBufferEntry& head = rob[rob_head];
+    
+    // 1. Verificar prontidão
+    if (head.state == "WRITE_RESULT" && head.value_ready) {
+        // 2. Atualizar registrador/memória
+        if (head.type != STORE) {
+            registers[head.destination_register].value = head.value;
+        } else {
+            memory[head.address] = head.value;
+        }
+        
+        // 3. Liberar entrada do ROB
+        head.busy = false;
+        rob_head = (rob_head + 1) % rob_size;
+        rob_entries_available++;
+    }
+}
+```
+
+### 4. Fluxo de Execução
+
+1. **Carregamento de Instruções**
+   - Leitura do arquivo de entrada
+   - Parsing das instruções
+   - Inicialização das estruturas
+
+2. **Emissão**
+   - Verificação de hazards
+   - Alocação no ROB
+   - Configuração da estação de reserva
+   - Renomeação de registradores
+
+3. **Execução**
+   - Contagem de ciclos
+   - Cálculo de resultados
+   - Broadcast pelo CDB
+
+4. **Write-Back**
+   - Processamento do CDB
+   - Atualização de dependências
+   - Liberação de recursos
+
+5. **Commit**
+   - Verificação de ordem
+   - Atualização de registradores
+   - Atualização de memória
+   - Liberação do ROB
+
+### 5. Detalhes de Implementação
+
+#### Gerenciamento de Dependências
+- Uso de tags do ROB para rastrear dependências
+- Sistema de broadcast pelo CDB
+- Atualização imediata de estações dependentes
+
+#### Renomeação de Registradores
+- Implementação através do producer_tag
+- Criação de novas versões a cada escrita
+- Associação de leituras com versões corretas
+
+#### Controle de Ordem
+- Uso do ROB para garantir ordem de commit
+- Execução fora de ordem permitida
+- Commit em ordem sequencial
+
+#### Tratamento de Erros
+- Verificação de divisão por zero
+- Validação de endereços de memória
+- Controle de overflow do ROB
+
 ## 🧩 Colaboradores
 | <img src="https://github.com/thomneuenschwander.png" width="100" height="100" alt="Thomas Neuenschwander"/> | <img src="https://github.com/DigoDrummond.png" width="100" height="100" alt="DigoDrummond"/> | <img src="https://github.com/CaioNotini.png" width="100" height="100" alt="CaioNotini "/> | <img src="https://github.com/EduardoAVS.png" width="100" height="100" alt="EduardoAVS "/> |
 |:---:|:---:|:---:|:---:|
